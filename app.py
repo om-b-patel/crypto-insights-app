@@ -29,46 +29,38 @@ def parse_holdings(s: str) -> dict:
     return out
 
 
-# Drop-in replacement for fetch_series (handles MultiIndex from yfinance)
-import pandas as pd
-import yfinance as yf
-
 def fetch_series(symbol: str) -> pd.Series:
+    """Return a 1y adjusted close Series (MultiIndex-safe)."""
     try:
         df = yf.download(symbol, period="1y", auto_adjust=True, progress=False)
         if df is None or df.empty:
-            return pd.Series(dtype=float)
+            return pd.Series(dtype=float, name=symbol)
 
-        # MultiIndex (e.g., ('Close','BTC-USD'))
+        # Handle MultiIndex (('Adj Close','BTC-USD')) or simple columns
         if isinstance(df.columns, pd.MultiIndex):
-            lv0 = df.columns.get_level_values(0)
-            # Prefer Adj Close, else Close
-            if "Adj Close" in lv0:
+            lvl0 = df.columns.get_level_values(0)
+            if "Adj Close" in lvl0:
                 sub = df["Adj Close"]
-                # sub may be a Series (single symbol) or DataFrame (multi)
-                s = sub if isinstance(sub, pd.Series) else (
-                    sub[symbol] if symbol in sub.columns else sub.iloc[:, 0]
-                )
-            elif "Close" in lv0:
+            elif "Close" in lvl0:
                 sub = df["Close"]
-                s = sub if isinstance(sub, pd.Series) else (
-                    sub[symbol] if symbol in sub.columns else sub.iloc[:, 0]
-                )
             else:
-                return pd.Series(dtype=float)
+                return pd.Series(dtype=float, name=symbol)
+            s = sub if isinstance(sub, pd.Series) else (sub[symbol] if symbol in sub.columns else sub.iloc[:, 0])
         else:
-            # Simple columns
             col = "Adj Close" if "Adj Close" in df.columns else ("Close" if "Close" in df.columns else None)
             if col is None:
-                return pd.Series(dtype=float)
+                return pd.Series(dtype=float, name=symbol)
             s = df[col]
 
-        return pd.Series(pd.to_numeric(s, errors="coerce").dropna(), name=symbol)
+        s = pd.to_numeric(pd.Series(s), errors="coerce").dropna()
+        s.name = symbol
+        return s
     except Exception:
-        return pd.Series(dtype=float)
+        return pd.Series(dtype=float, name=symbol)
 
 
 def build_portfolio_df(holdings: dict) -> pd.DataFrame:
+    """Align on daily frequency, forward-fill gaps, then compute Portfolio."""
     frames = []
     for sym, qty in holdings.items():
         if qty <= 0:
@@ -79,14 +71,24 @@ def build_portfolio_df(holdings: dict) -> pd.DataFrame:
         frames.append((sym, s * float(qty)))
     if not frames:
         return pd.DataFrame()
-    df = pd.concat([f[1].rename(f[0]) for f in frames], axis=1)
-    df = df.dropna(how="all")
-    df["Portfolio"] = df.sum(axis=1)
+
+    # Outer-join all series → calendar → daily asfreq → ffill
+    df = pd.concat([f[1].rename(f[0]) for f in frames], axis=1, join="outer")
+    if df.empty:
+        return pd.DataFrame()
+    # Ensure DateTimeIndex and daily frequency
+    df.index = pd.to_datetime(df.index)
+    df = df.sort_index()
+    # Reindex to daily calendar covering full span and ffill prices
+    daily_index = pd.date_range(df.index.min(), df.index.max(), freq="D")
+    df = df.reindex(daily_index).ffill()
+
+    df["Portfolio"] = df.sum(axis=1, skipna=True)
     return df
 
 
 def main():
-    # Log once per browser session
+    # Log once per session
     if "logged_once" not in st.session_state:
         log_usage()
         st.session_state["logged_once"] = True
@@ -107,10 +109,13 @@ def main():
         return
 
     st.subheader("Portfolio Value Index")
-    port = df["Portfolio"].astype(float).dropna()
-    if not port.empty:
-        idx = (port / port.iloc[0]) * 100.0
+    port = pd.to_numeric(df["Portfolio"], errors="coerce").dropna()
+    if len(port) >= 2:
+        base = float(port.iloc[0]) if float(port.iloc[0]) != 0 else float(port.replace(0, float("nan")).dropna().iloc[0])
+        idx = (port / base) * 100.0
         st.line_chart(pd.DataFrame({"Portfolio Index": idx}))
+    else:
+        st.info("Not enough data points to plot index yet.")
 
     st.subheader("Current Allocation")
     latest_values = df.iloc[-1].drop(labels=["Portfolio"]).dropna()
@@ -119,7 +124,8 @@ def main():
         alloc = (latest_values / total) * 100.0
         st.bar_chart(alloc.to_frame("Weight (%)"))
         st.dataframe(latest_values.sort_values(ascending=False).to_frame("Latest Value"))
-
+    else:
+        st.info("No latest values available.")
 
 if __name__ == "__main__":
     main()
